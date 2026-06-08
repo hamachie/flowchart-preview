@@ -493,6 +493,7 @@
   // =========================================================================
   function ZoomCanvas({ focusPath, focusedNodeId, onNode, onBackground, onZoomCommit, registerApi }) {
     const stageRef = useRef(null);
+    const worldRef = useRef(null);
     const [vp, setVp] = useState({ w: 1200, h: 800 });
     const [cam, setCam] = useState({ scale: 0.5, tx: 0, ty: 0 });
     const [animate, setAnimate] = useState(true);
@@ -500,6 +501,29 @@
     camRef.current = cam;
     const focusPathRef = useRef(focusPath);
     focusPathRef.current = focusPath;
+
+    // ---- Direct-DOM camera path -------------------------------------------
+    // During gestures (touch, wheel, pinch) we bypass React entirely: write
+    // the transform straight to the .world element's style on every frame.
+    // React state is reconciled once per animation frame, which keeps the
+    // visibility / drill logic in sync without the 60+ renders per second
+    // that were making touch feel laggy.
+    const commitRaf = useRef(0);
+    const applyLive = useCallback((scale, tx, ty) => {
+      camRef.current = { scale, tx, ty };
+      if (worldRef.current) {
+        worldRef.current.style.transform = `translate3d(${tx}px, ${ty}px, 0) scale(${scale})`;
+      }
+    }, []);
+    const scheduleCommit = useCallback(() => {
+      if (commitRaf.current) return;
+      commitRaf.current = requestAnimationFrame(() => {
+        commitRaf.current = 0;
+        const c = camRef.current;
+        setAnimate(false);
+        setCam({ scale: c.scale, tx: c.tx, ty: c.ty });
+      });
+    }, []);
 
     // measure viewport — synchronously on mount (before the fit effect runs)
     // so the first camera fit uses the real stage size, not the default.
@@ -600,9 +624,9 @@
           }
         }
       }
-      setAnimate(false);
-      setCam({ scale: ns, tx: ntx, ty: nty });
-    }, []);
+      applyLive(ns, ntx, nty);
+      scheduleCommit();
+    }, [applyLive, scheduleCommit]);
     const onWheel = useCallback((e) => {
       e.preventDefault();
       const rect = stageRef.current.getBoundingClientRect();
@@ -625,22 +649,57 @@
       }
     }, [flushWheel]);
 
-    // Pointer-based pan and pinch-zoom.
-    //   • 1 pointer down  → drag-to-pan
+    // Pointer-based pan and pinch-zoom with momentum.
+    //   • 1 pointer down  → drag-to-pan, glides after release (inertia)
     //   • 2 pointers down → pinch-to-zoom around the midpoint of the two fingers
-    // Multi-touch lifts back to single-touch cleanly: lifting one finger of a
-    // pinch resumes panning from the remaining finger without jumping.
+    // All transform updates write directly to the .world DOM node via applyLive,
+    // bypassing React's reconciler during the gesture. React state syncs once
+    // per frame via scheduleCommit so visibility/auto-drill stay current.
     const drag = useRef(null);
     const pointers = useRef(new Map());
     const pinch = useRef(null);
+    const velocity = useRef({ vx: 0, vy: 0, t: 0, x: 0, y: 0 });
+    const inertiaRaf = useRef(0);
+
+    const stopInertia = useCallback(() => {
+      if (inertiaRaf.current) {
+        cancelAnimationFrame(inertiaRaf.current);
+        inertiaRaf.current = 0;
+      }
+    }, []);
+
+    const startInertia = useCallback(() => {
+      stopInertia();
+      let vx = velocity.current.vx;
+      let vy = velocity.current.vy;
+      // ignore tiny flicks — feels jittery otherwise
+      if (Math.abs(vx) < 0.4 && Math.abs(vy) < 0.4) { scheduleCommit(); return; }
+      const step = () => {
+        // 0.93 = decay per frame. Tuned for a natural ~400ms glide that
+        // matches what people expect from native iOS scroll inertia.
+        vx *= 0.93;
+        vy *= 0.93;
+        if (Math.abs(vx) < 0.15 && Math.abs(vy) < 0.15) {
+          inertiaRaf.current = 0;
+          scheduleCommit();
+          return;
+        }
+        const c = camRef.current;
+        applyLive(c.scale, c.tx + vx, c.ty + vy);
+        inertiaRaf.current = requestAnimationFrame(step);
+      };
+      inertiaRaf.current = requestAnimationFrame(step);
+    }, [applyLive, scheduleCommit, stopInertia]);
 
     const onPointerDown = (e) => {
       if (e.target.closest(".node")) return; // let node clicks through
+      stopInertia(); // touching the canvas cancels any flying-glide in progress
       try { stageRef.current.setPointerCapture(e.pointerId); } catch (_) {}
       pointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
 
       if (pointers.current.size === 1) {
         drag.current = { x: e.clientX, y: e.clientY, tx: camRef.current.tx, ty: camRef.current.ty, moved: false };
+        velocity.current = { vx: 0, vy: 0, t: performance.now(), x: e.clientX, y: e.clientY };
         stageRef.current.classList.add("is-panning");
       } else if (pointers.current.size === 2) {
         // start pinch — snapshot scale + translate so the math stays stable
@@ -671,13 +730,25 @@
         const k = ns / pinch.current.initialScale;
         const ntx = pinch.current.centerX - (pinch.current.centerX - pinch.current.initialTx) * k;
         const nty = pinch.current.centerY - (pinch.current.centerY - pinch.current.initialTy) * k;
-        setAnimate(false);
-        setCam({ scale: ns, tx: ntx, ty: nty });
+        applyLive(ns, ntx, nty);
+        scheduleCommit();
       } else if (drag.current) {
         const dx = e.clientX - drag.current.x, dy = e.clientY - drag.current.y;
         if (Math.abs(dx) + Math.abs(dy) > 4) drag.current.moved = true;
-        setAnimate(false);
-        setCam((c) => ({ ...c, tx: drag.current.tx + dx, ty: drag.current.ty + dy }));
+        const c = camRef.current;
+        applyLive(c.scale, drag.current.tx + dx, drag.current.ty + dy);
+        // sample velocity for the inertia glide — exponential decay smooths
+        // noisy single-event samples
+        const now = performance.now();
+        const dt = Math.max(now - velocity.current.t, 1);
+        const ivx = (e.clientX - velocity.current.x) * (16 / dt);
+        const ivy = (e.clientY - velocity.current.y) * (16 / dt);
+        velocity.current = {
+          vx: velocity.current.vx * 0.55 + ivx * 0.45,
+          vy: velocity.current.vy * 0.55 + ivy * 0.45,
+          t: now, x: e.clientX, y: e.clientY,
+        };
+        scheduleCommit();
       }
     };
 
@@ -690,13 +761,16 @@
 
       if (pointers.current.size === 0) {
         const wasMoved = drag.current && drag.current.moved;
+        const wasPan = !!drag.current;
         drag.current = null;
         stageRef.current && stageRef.current.classList.remove("is-panning");
         if (had && !wasMoved && e && !e.target.closest(".node")) onBackground();
+        else if (wasPan && wasMoved) startInertia();
       } else if (pointers.current.size === 1 && !drag.current) {
         // pinch ended; one finger still down — resume pan from its current pos
         const [remaining] = Array.from(pointers.current.values());
         drag.current = { x: remaining.x, y: remaining.y, tx: camRef.current.tx, ty: camRef.current.ty, moved: true };
+        velocity.current = { vx: 0, vy: 0, t: performance.now(), x: remaining.x, y: remaining.y };
       }
     };
 
@@ -715,7 +789,7 @@
         onPointerUp={endDrag}
         onPointerCancel={endDrag}
       >
-        <div className={`world ${animate ? "" : "no-anim"}`} style={{ transform: `translate(${cam.tx}px, ${cam.ty}px) scale(${cam.scale})` }}>
+        <div ref={worldRef} className={`world ${animate ? "" : "no-anim"}`} style={{ transform: `translate3d(${cam.tx}px, ${cam.ty}px, 0) scale(${cam.scale})` }}>
           <Scene
             sceneId={window.FIU.meta.rootScene}
             pathPrefix={[]}
