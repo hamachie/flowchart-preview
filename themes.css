@@ -600,4 +600,27 @@ html[data-theme="atlas"] .node .drill-tag { color: var(--accent); background: rg
   .info { transform: translateY(calc(100% + 24px)); }
   .legend { display: none; }
   .brand-sub { display: none; }
+
+  /* tighten the topbar so brand, crumbs, and zoom buttons stop colliding */
+  .topbar { gap: 10px; padding: 10px 12px; flex-wrap: nowrap; }
+  .brand { gap: 8px; flex: none; }
+  .brand-mark { width: 32px; height: 32px; font-size: 17px; border-radius: 8px; }
+  .brand-title { font-size: 15px; line-height: 1.1; }
+  .brand-text { overflow: hidden; }
+  .crumbs { gap: 2px; min-width: 0; flex: 1 1 auto; overflow: hidden; flex-wrap: nowrap; }
+  .crumb { font-size: 12px; padding: 4px 6px; overflow: hidden; text-overflow: ellipsis; }
+  .topbar-actions { gap: 4px; flex: none; }
+  .tbtn { height: 32px; padding: 0 9px; font-size: 12px; gap: 4px; }
+  .tbtn .ico { width: 13px; height: 13px; }
+}
+
+@media (max-width: 460px) {
+  /* on really narrow phones, drop the brand wordmark entirely — just the FI tile */
+  .brand-text { display: none; }
+  .topbar { padding: 8px 10px; gap: 8px; }
+  /* hide span text in topbar buttons — just show the icon */
+  .tbtn span { display: none; }
+  .tbtn { padding: 0 9px; gap: 0; }
+  /* hide the "Map" label in the home crumb too — icon is enough */
+  .crumb span { display: none; }
 }
