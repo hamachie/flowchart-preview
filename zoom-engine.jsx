@@ -17,6 +17,12 @@
 
   const SC = (id) => window.FIU.scenes[id];
   const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+
+  // Shared guard so the camera (pan/pinch) can tell a node "the user is
+  // gesturing, don't treat this pointerup as a click on you." Set by
+  // ZoomCanvas when a pan moves past the tap threshold or a pinch starts,
+  // read by NodeFace before it fires its onClick. Reset on every pointerdown.
+  const gestureGuard = { suppressNodeClick: false };
   const smoothstep = (a, b, x) => {
     const t = clamp((x - a) / (b - a), 0, 1);
     return t * t * (3 - 2 * t);
@@ -376,7 +382,13 @@
       </React.Fragment>
     );
     return (
-      <div className={cls} style={style} onClick={(e) => { e.stopPropagation(); onClick(node); }}>
+      <div className={cls} style={style} onClick={(e) => {
+        e.stopPropagation();
+        // If the user was panning/pinching and happened to release over this
+        // node, skip the click — they didn't mean to open it.
+        if (gestureGuard.suppressNodeClick) { gestureGuard.suppressNodeClick = false; return; }
+        onClick(node);
+      }}>
         {node.tone === "decision" ? <div className="inner">{body}</div> : body}
       </div>
     );
@@ -552,7 +564,9 @@
     const bounds = useMemo(() => {
       const activeFit = fitCamera(targetRect(focusPath), vp.w, vp.h, focusPath.length === 0 ? 0.9 : 0.82).scale;
       const rootFit = fitCamera(targetRect([]), vp.w, vp.h, 0.9).scale;
-      return { min: rootFit * 0.45, max: activeFit * 2.6 };
+      // Max 5× the fit-scale so you can zoom deep into a single box
+      // and read fine detail (was 2.6× which felt limiting).
+      return { min: rootFit * 0.45, max: activeFit * 5 };
     }, [focusPath, vp.w, vp.h]);
     const boundsRef = useRef(bounds);
     boundsRef.current = bounds;
@@ -672,14 +686,14 @@
       stopInertia();
       let vx = velocity.current.vx;
       let vy = velocity.current.vy;
-      // ignore tiny flicks — feels jittery otherwise
-      if (Math.abs(vx) < 0.4 && Math.abs(vy) < 0.4) { scheduleCommit(); return; }
+      // Only glide for a definite flick — small drag releases should stop
+      // immediately. Otherwise it feels slippery.
+      if (Math.abs(vx) < 1.5 && Math.abs(vy) < 1.5) { scheduleCommit(); return; }
       const step = () => {
-        // 0.93 = decay per frame. Tuned for a natural ~400ms glide that
-        // matches what people expect from native iOS scroll inertia.
-        vx *= 0.93;
-        vy *= 0.93;
-        if (Math.abs(vx) < 0.15 && Math.abs(vy) < 0.15) {
+        // 0.86 decay = ~180ms glide, controllable. Was 0.93 (slippery).
+        vx *= 0.86;
+        vy *= 0.86;
+        if (Math.abs(vx) < 0.3 && Math.abs(vy) < 0.3) {
           inertiaRaf.current = 0;
           scheduleCommit();
           return;
@@ -692,7 +706,9 @@
     }, [applyLive, scheduleCommit, stopInertia]);
 
     const onPointerDown = (e) => {
-      if (e.target.closest(".node")) return; // let node clicks through
+      // Reset the guard for this new gesture — a fresh tap is a fresh chance
+      // to click a node.
+      gestureGuard.suppressNodeClick = false;
       stopInertia(); // touching the canvas cancels any flying-glide in progress
       try { stageRef.current.setPointerCapture(e.pointerId); } catch (_) {}
       pointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
@@ -702,7 +718,9 @@
         velocity.current = { vx: 0, vy: 0, t: performance.now(), x: e.clientX, y: e.clientY };
         stageRef.current.classList.add("is-panning");
       } else if (pointers.current.size === 2) {
-        // start pinch — snapshot scale + translate so the math stays stable
+        // Two fingers = pinch. Suppress any click that might fire when fingers
+        // come off so a pinch never accidentally opens a box.
+        gestureGuard.suppressNodeClick = true;
         drag.current = null;
         const ptrs = Array.from(pointers.current.values());
         const rect = stageRef.current.getBoundingClientRect();
@@ -716,6 +734,11 @@
         };
       }
     };
+
+    // Tap-vs-pan threshold (px from initial pointerdown). Anything below this
+    // counts as a tap and lets a node click through. Above, we mark the
+    // gesture as a pan and suppress any node click that would fire on release.
+    const TAP_THRESHOLD = 8;
 
     const onPointerMove = (e) => {
       if (!pointers.current.has(e.pointerId)) return;
@@ -734,7 +757,12 @@
         scheduleCommit();
       } else if (drag.current) {
         const dx = e.clientX - drag.current.x, dy = e.clientY - drag.current.y;
-        if (Math.abs(dx) + Math.abs(dy) > 4) drag.current.moved = true;
+        // Use Euclidean distance for a fair threshold in any direction.
+        if (Math.hypot(dx, dy) > TAP_THRESHOLD) {
+          drag.current.moved = true;
+          gestureGuard.suppressNodeClick = true;
+        }
+        if (!drag.current.moved) return; // still inside tap tolerance — don't move the camera at all
         const c = camRef.current;
         applyLive(c.scale, drag.current.tx + dx, drag.current.ty + dy);
         // sample velocity for the inertia glide — exponential decay smooths
@@ -744,8 +772,8 @@
         const ivx = (e.clientX - velocity.current.x) * (16 / dt);
         const ivy = (e.clientY - velocity.current.y) * (16 / dt);
         velocity.current = {
-          vx: velocity.current.vx * 0.55 + ivx * 0.45,
-          vy: velocity.current.vy * 0.55 + ivy * 0.45,
+          vx: velocity.current.vx * 0.35 + ivx * 0.65,
+          vy: velocity.current.vy * 0.35 + ivy * 0.65,
           t: now, x: e.clientX, y: e.clientY,
         };
         scheduleCommit();
