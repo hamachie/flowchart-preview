@@ -258,6 +258,12 @@ body {
   background:
     radial-gradient(120% 120% at 50% 0%, color-mix(in srgb, var(--canvas-2) 60%, transparent), transparent 70%),
     var(--canvas);
+  /* Claim all touch gestures for the canvas pan/zoom logic so mobile
+     browsers don't try to scroll the page or pinch-zoom the viewport. */
+  touch-action: none;
+  -webkit-user-select: none;
+  user-select: none;
+  overscroll-behavior: contain;
 }
 .stage.is-panning { cursor: grabbing; }
 .stage::before {
