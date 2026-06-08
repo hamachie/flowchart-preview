@@ -625,25 +625,79 @@
       }
     }, [flushWheel]);
 
-    // drag to pan
+    // Pointer-based pan and pinch-zoom.
+    //   • 1 pointer down  → drag-to-pan
+    //   • 2 pointers down → pinch-to-zoom around the midpoint of the two fingers
+    // Multi-touch lifts back to single-touch cleanly: lifting one finger of a
+    // pinch resumes panning from the remaining finger without jumping.
     const drag = useRef(null);
+    const pointers = useRef(new Map());
+    const pinch = useRef(null);
+
     const onPointerDown = (e) => {
       if (e.target.closest(".node")) return; // let node clicks through
-      drag.current = { x: e.clientX, y: e.clientY, tx: camRef.current.tx, ty: camRef.current.ty, moved: false };
-      stageRef.current.classList.add("is-panning");
+      try { stageRef.current.setPointerCapture(e.pointerId); } catch (_) {}
+      pointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+      if (pointers.current.size === 1) {
+        drag.current = { x: e.clientX, y: e.clientY, tx: camRef.current.tx, ty: camRef.current.ty, moved: false };
+        stageRef.current.classList.add("is-panning");
+      } else if (pointers.current.size === 2) {
+        // start pinch — snapshot scale + translate so the math stays stable
+        drag.current = null;
+        const ptrs = Array.from(pointers.current.values());
+        const rect = stageRef.current.getBoundingClientRect();
+        pinch.current = {
+          initialDist: Math.hypot(ptrs[1].x - ptrs[0].x, ptrs[1].y - ptrs[0].y),
+          initialScale: camRef.current.scale,
+          initialTx: camRef.current.tx,
+          initialTy: camRef.current.ty,
+          centerX: (ptrs[0].x + ptrs[1].x) / 2 - rect.left,
+          centerY: (ptrs[0].y + ptrs[1].y) / 2 - rect.top,
+        };
+      }
     };
+
     const onPointerMove = (e) => {
-      if (!drag.current) return;
-      const dx = e.clientX - drag.current.x, dy = e.clientY - drag.current.y;
-      if (Math.abs(dx) + Math.abs(dy) > 4) drag.current.moved = true;
-      setAnimate(false);
-      setCam((c) => ({ ...c, tx: drag.current.tx + dx, ty: drag.current.ty + dy }));
+      if (!pointers.current.has(e.pointerId)) return;
+      pointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+      if (pinch.current && pointers.current.size >= 2) {
+        const ptrs = Array.from(pointers.current.values());
+        const dist = Math.hypot(ptrs[1].x - ptrs[0].x, ptrs[1].y - ptrs[0].y);
+        const b = boundsRef.current;
+        const factor = dist / pinch.current.initialDist;
+        const ns = clamp(pinch.current.initialScale * factor, b.min, b.max);
+        const k = ns / pinch.current.initialScale;
+        const ntx = pinch.current.centerX - (pinch.current.centerX - pinch.current.initialTx) * k;
+        const nty = pinch.current.centerY - (pinch.current.centerY - pinch.current.initialTy) * k;
+        setAnimate(false);
+        setCam({ scale: ns, tx: ntx, ty: nty });
+      } else if (drag.current) {
+        const dx = e.clientX - drag.current.x, dy = e.clientY - drag.current.y;
+        if (Math.abs(dx) + Math.abs(dy) > 4) drag.current.moved = true;
+        setAnimate(false);
+        setCam((c) => ({ ...c, tx: drag.current.tx + dx, ty: drag.current.ty + dy }));
+      }
     };
+
     const endDrag = (e) => {
-      const wasMoved = drag.current && drag.current.moved;
-      drag.current = null;
-      stageRef.current && stageRef.current.classList.remove("is-panning");
-      if (!wasMoved && e && !e.target.closest(".node")) onBackground();
+      const had = pointers.current.has(e.pointerId);
+      pointers.current.delete(e.pointerId);
+      try { stageRef.current.releasePointerCapture(e.pointerId); } catch (_) {}
+
+      if (pointers.current.size < 2) pinch.current = null;
+
+      if (pointers.current.size === 0) {
+        const wasMoved = drag.current && drag.current.moved;
+        drag.current = null;
+        stageRef.current && stageRef.current.classList.remove("is-panning");
+        if (had && !wasMoved && e && !e.target.closest(".node")) onBackground();
+      } else if (pointers.current.size === 1 && !drag.current) {
+        // pinch ended; one finger still down — resume pan from its current pos
+        const [remaining] = Array.from(pointers.current.values());
+        drag.current = { x: remaining.x, y: remaining.y, tx: camRef.current.tx, ty: camRef.current.ty, moved: true };
+      }
     };
 
     useEffect(() => {
@@ -659,7 +713,7 @@
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
         onPointerUp={endDrag}
-        onPointerLeave={() => { drag.current = null; stageRef.current && stageRef.current.classList.remove("is-panning"); }}
+        onPointerCancel={endDrag}
       >
         <div className={`world ${animate ? "" : "no-anim"}`} style={{ transform: `translate(${cam.tx}px, ${cam.ty}px) scale(${cam.scale})` }}>
           <Scene
