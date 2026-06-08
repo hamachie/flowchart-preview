@@ -549,42 +549,81 @@
       });
     }, [registerApi, vp.w, vp.h]);
 
-    // wheel zoom around pointer — and auto-drill into a ⊕ node when you zoom
-    // far enough into it (zoom itself becomes navigation = "infinite zoom").
+    // Wheel handler — Figma/Miro style:
+    //   • Two-finger scroll (or mouse wheel)          → pan
+    //   • Pinch on trackpad (sends wheel + ctrlKey)   → zoom around pointer
+    //   • Cmd/Ctrl + wheel                            → also zoom (mouse fallback)
+    // Wheel events are batched via requestAnimationFrame so React only re-renders
+    // once per frame, even when the trackpad fires events at 120 Hz. That keeps
+    // panning buttery and zooming silky on macOS trackpads in particular.
     const drillArmed = useRef(false);
-    const onWheel = useCallback((e) => {
-      e.preventDefault();
+    const pending = useRef({ pan: { dx: 0, dy: 0 }, zoom: null, raf: 0 });
+    const flushWheel = useCallback(() => {
+      pending.current.raf = 0;
       const c = camRef.current;
       const b = boundsRef.current;
-      const rect = stageRef.current.getBoundingClientRect();
-      const px = e.clientX - rect.left, py = e.clientY - rect.top;
-      const factor = Math.exp(-e.deltaY * 0.0016);
-      const ns = clamp(c.scale * factor, b.min, b.max);
-      const k = ns / c.scale;
-      const ntx = px - (px - c.tx) * k, nty = py - (py - c.ty) * k;
-      setAnimate(false);
-      setCam({ scale: ns, tx: ntx, ty: nty });
+      let ns = c.scale, ntx = c.tx, nty = c.ty;
+      // apply pan
+      const pan = pending.current.pan;
+      if (pan.dx !== 0 || pan.dy !== 0) {
+        ntx -= pan.dx;
+        nty -= pan.dy;
+        pending.current.pan = { dx: 0, dy: 0 };
+      }
+      // apply zoom (around the last cursor position)
+      const zoom = pending.current.zoom;
+      if (zoom) {
+        const factor = Math.exp(-zoom.dy * 0.012);
+        ns = clamp(c.scale * factor, b.min, b.max);
+        const k = ns / c.scale;
+        ntx = zoom.px - (zoom.px - ntx) * k;
+        nty = zoom.py - (zoom.py - nty) * k;
+        pending.current.zoom = null;
 
-      // when pinned at the ceiling and still pushing inward, look for a child
-      // node under the cursor and fly into it.
-      const zoomingIn = e.deltaY < 0;
-      const atCeiling = ns >= b.max - 1e-3;
-      if (zoomingIn && atCeiling && !drillArmed.current) {
-        const wx = (px - ntx) / ns, wy = (py - nty) / ns;
-        const { T, sceneId } = activeTransform(focusPathRef.current);
-        const scene = SC(sceneId);
-        const hit = scene.nodes.find((n) => {
-          if (!n.child) return false;
-          const x = T.ox + T.s * n.x, y = T.oy + T.s * n.y;
-          return wx >= x && wx <= x + T.s * n.w && wy >= y && wy <= y + T.s * n.h;
-        });
-        if (hit) {
-          drillArmed.current = true;
-          onZoomCommit([...focusPathRef.current, hit.id]);
-          setTimeout(() => (drillArmed.current = false), 700);
+        // auto-drill: when pinned at the ceiling and still zooming in, fly
+        // into whichever child node sits under the cursor.
+        const zoomingIn = zoom.dy < 0;
+        const atCeiling = ns >= b.max - 1e-3;
+        if (zoomingIn && atCeiling && !drillArmed.current) {
+          const wx = (zoom.px - ntx) / ns, wy = (zoom.py - nty) / ns;
+          const { T, sceneId } = activeTransform(focusPathRef.current);
+          const scene = SC(sceneId);
+          const hit = scene.nodes.find((n) => {
+            if (!n.child) return false;
+            const x = T.ox + T.s * n.x, y = T.oy + T.s * n.y;
+            return wx >= x && wx <= x + T.s * n.w && wy >= y && wy <= y + T.s * n.h;
+          });
+          if (hit) {
+            drillArmed.current = true;
+            onZoomCommit([...focusPathRef.current, hit.id]);
+            setTimeout(() => (drillArmed.current = false), 700);
+          }
         }
       }
+      setAnimate(false);
+      setCam({ scale: ns, tx: ntx, ty: nty });
     }, []);
+    const onWheel = useCallback((e) => {
+      e.preventDefault();
+      const rect = stageRef.current.getBoundingClientRect();
+      const px = e.clientX - rect.left, py = e.clientY - rect.top;
+      // Pinch on macOS trackpad sets ctrlKey automatically; explicit Cmd/Ctrl
+      // also means "zoom" so mouse-only users can still zoom with modifier.
+      const wantZoom = e.ctrlKey || e.metaKey;
+      if (wantZoom) {
+        // Accumulate zoom intent for this frame; the last cursor position wins.
+        const prev = pending.current.zoom;
+        pending.current.zoom = { dy: (prev ? prev.dy : 0) + e.deltaY, px, py };
+      } else {
+        // Accumulate pan intent. deltaX/deltaY from two-finger swipe are small
+        // per event but arrive often — batching keeps it smooth.
+        pending.current.pan.dx += e.deltaX;
+        pending.current.pan.dy += e.deltaY;
+      }
+      if (!pending.current.raf) {
+        pending.current.raf = requestAnimationFrame(flushWheel);
+      }
+    }, [flushWheel]);
 
     // drag to pan
     const drag = useRef(null);
